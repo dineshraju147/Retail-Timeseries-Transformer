@@ -1,0 +1,71 @@
+# config_m5.yaml
+# ---------------------------------------------------------
+# Configuration for preparing and managing M5 sales data
+# for Transformer-based forecasting
+# ---------------------------------------------------------
+# This file specifies:
+# - Dataset input paths
+# - Preprocessed output locations
+# - Time aggregation parameters
+# - Train/test split and metadata
+
+dataset:
+  # Path to raw or preprocessed M5 dataset
+  # (can be weekly or monthly aggregated version)
+  raw_data_path: data/m5/raw/m5_sales_weekly.csv
+
+  # Path where processed version for Transformer will be stored
+  processed_data_path: data/m5/processed/m5_processed_for_transformer.csv
+
+  # Whether data is aggregated weekly or monthly
+  frequency: weekly
+
+  # Columns used in model
+  columns:
+    - id
+    - item_id
+    - dept_id
+    - cat_id
+    - store_id
+    - state_id
+    - item_id_encoded
+    - store_id_encoded
+    - dept_id_encoded
+    - cat_id_encoded
+    - state_id_encoded
+    - year_week
+    - week_of_year
+    - sales
+    - sell_price
+    - date
+    - year
+    - month
+    - event_name_1_encoded
+    - event_name_2_encoded
+    - event_type_1_encoded
+    - event_type_2_encoded
+    - snap_CA_encoded
+    - snap_TX_encoded
+    - snap_WI_encoded
+    - week_num_global
+    - week_num_per_item
+
+training:
+  # Whether to retrain model or use existing weights
+  retrain_model: true
+
+  # Random seed for reproducibility
+  seed: 42
+
+  # Fraction of data used for training
+  train_ratio: 0.8
+
+output:
+  # Folder for logs, checkpoints, and predictions
+  model_output_dir: model_paths/
+  predictions_dir: predictions_m5/
+
+dates:
+  # Optional date range filters if you want to restrict training window
+  start_date: 2011-01-01
+  end_date: 2016-06-30

@@ -1,0 +1,42 @@
+# model_config_m5.yaml
+# ---------------------------------------------------------
+# Configuration for Transformer-based M5 Sales Forecasting
+# ---------------------------------------------------------
+# This config defines model training hyperparameters,
+# feature mapping, checkpoint paths, and model architecture.
+
+SEED: 42
+
+# Target variable to forecast
+TARGET_FEATURE_COLUMN: sales
+
+# Forecast horizon (e.g., predict next 1 week)
+FORECAST_STEPS: 1
+
+# Number of historical lags to use as input
+FEATURE_LAG: 8
+
+# Training parameters
+EPOCHS: 20
+BATCH_SIZE: 32
+LEARNING_RATE: 0.001
+
+# File paths for saving model artifacts
+CHECKPOINT_PATH: model_paths/m5_forecast_model.pth
+METADATA_PATH: model_paths/m5_model_metadata.pkl
+PREDICT_OUTPUT_DIR: predictions_m5
+
+# Model architecture parameters
+MODEL_PARAMS:
+  FEATURE_LAG: 8
+  output_dim: 1
+  input_dim_seq: 2           # (sales, sell_price)
+  input_dim_static: 2        # (store_id_encoded, item_id_encoded)
+  embed_size: 64
+  nhead: 8
+  num_layers: 6
+  dim_feedforward: 512
+  dropout: 0.1
+  conv1d_emb: true
+  conv1d_kernel_size: 3
+  device: "mps"
