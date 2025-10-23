@@ -12,10 +12,10 @@
 dataset:
   # Path to raw or preprocessed M5 dataset
   # (can be weekly or monthly aggregated version)
-  raw_data_path: data/m5/raw/m5_sales_weekly.csv
+  raw_data_path: data/m5_weekly.csv
 
   # Path where processed version for Transformer will be stored
-  processed_data_path: data/m5/processed/m5_processed_for_transformer.csv
+  processed_data_path: data/m5_weekly.csv
 
   # Whether data is aggregated weekly or monthly
   frequency: weekly

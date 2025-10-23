@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from .transformer_baseline_m5 import ForecastingModel
+from models.transformer_baseline_m5 import ForecastingModel
 
 def normalize_data(data, name="feature"):
     mean, std = float(np.mean(data)), float(np.std(data))
@@ -38,6 +38,16 @@ def train_loop(model, dataloader, criterion, optimizer, scheduler, epochs, devic
             pred = model(x_seq, x_static)
             loss = criterion(pred, y)
             loss.backward()
+            # debug: gradient norms
+
+            # total_norm = 0.0
+            # for p in model.parameters():
+            #     if p.grad is not None:
+            #         total_norm += p.grad.data.norm(2).item()
+            # print("batch pred mean,std:", pred.detach().cpu().mean().item(), pred.detach().cpu().std().item())
+            # print("batch y mean,std:", y.detach().cpu().mean().item(), y.detach().cpu().std().item())
+            # print("grad norm:", total_norm)
+
             optimizer.step()
             losses.append(loss.item())
         avg_loss = np.mean(losses)
@@ -71,7 +81,11 @@ def main(config_path, csv_path):
                             torch.tensor(Y, dtype=torch.float32))
     dataloader = DataLoader(dataset, batch_size=config["BATCH_SIZE"], shuffle=True)
 
-    model = ForecastingModel(**config["MODEL_PARAMS"]).to(device)
+    # after: ensure MODEL_PARAMS includes "output_dim": config["FORECAST_STEPS"]
+    params = dict(config["MODEL_PARAMS"])
+    params["output_dim"] = config["FORECAST_STEPS"]
+    model = ForecastingModel(**params).to(device)
+
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=config["LEARNING_RATE"])
     scheduler = ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
@@ -101,4 +115,5 @@ if __name__ == "__main__":
     parser.add_argument("--config", required=True)
     parser.add_argument("--csv", required=True)
     args = parser.parse_args()
+    print(args)
     main(args.config, args.csv)
