@@ -11,13 +11,13 @@ SEED: 42
 TARGET_FEATURE_COLUMN: sales
 
 # Forecast horizon (e.g., predict next 1 week)
-FORECAST_STEPS: 1
+FORECAST_STEPS: 8
 
 # Number of historical lags to use as input
 FEATURE_LAG: 8
 
 # Training parameters
-EPOCHS: 1
+EPOCHS: 10
 BATCH_SIZE: 32
 LEARNING_RATE: 0.001
 

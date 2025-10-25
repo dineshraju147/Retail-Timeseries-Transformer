@@ -1,161 +1,107 @@
-"""
-transformer_baseline_m5.py
-
-Defines the core Transformer-based architecture for M5 sales forecasting.
-
-Classes:
-    PositionalEncoding(nn.Module): Adds positional information to sequential input data.
-    ForecastingModel(nn.Module): Transformer-based regression model for sales forecasting,
-                                 using both dynamic (time-series) and static (store/item) features.
-
-Usage:
-    from transformer_baseline_m5 import ForecastingModel
-    model = ForecastingModel(FEATURE_LAG=8, output_dim=1, input_dim_seq=2, input_dim_static=2, ...)
-    y_pred = model(x_seq, x_static)
-
-Notes:
-    - Sequential features include: [sales, sell_price]
-    - Static features include: [store_id_encoded, item_id_encoded]
-    - Supports both Conv1D and Linear embedding for sequence input.
-    - Position encoding is applied before Transformer encoder layers.
-"""
+# ---------------------------------------------------------
+# transformer_baseline_m5_fixed.py
+# Updated Transformer model for M5 Forecasting
+# ---------------------------------------------------------
 
 import math
 import torch
-from torch import nn, Tensor
-from torch.nn.modules.transformer import TransformerEncoderLayer, TransformerEncoder
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 class PositionalEncoding(nn.Module):
-    """Adds sinusoidal positional encodings to the input sequence embeddings."""
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
         self.register_buffer("pe", pe)
 
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x (Tensor): [seq_len, batch_size, embed_dim]
-        Returns:
-            Tensor: Same shape as input with positional encoding added.
-        """
-        x = x + self.pe[:x.size(0)]
+    def forward(self, x):
+        x = x + self.pe[:, : x.size(1), :]
         return self.dropout(x)
 
 
 class ForecastingModel(nn.Module):
     """
-    Transformer-based regression model for M5 time series sales forecasting.
-
-    Inputs:
-        - x_seq: Sequential features [batch, seq_len, input_dim_seq]
-                  (e.g., sales and sell_price)
-        - x_static: Static features [batch, input_dim_static]
-                    (e.g., store_id_encoded, item_id_encoded)
-    Output:
-        - y_pred: Forecasted sales [batch, output_dim]
+    Transformer model for M5 forecasting with:
+      - mean pooling over time (no flattening)
+      - store/item categorical embeddings
+      - optional static continuous input
+      - multi-step forecasting (output_dim = FORECAST_STEPS)
     """
 
     def __init__(
         self,
-        FEATURE_LAG=8,
-        output_dim=1,
-        input_dim_seq=2,
-        input_dim_static=2,
-        embed_size=128,
+        input_dim_seq,
+        input_dim_static,
+        embed_size=64,
         nhead=8,
-        num_layers=6,
-        dim_feedforward=512,
+        num_layers=2,
+        dim_feedforward=256,
         dropout=0.1,
-        conv1d_emb=True,
-        conv1d_kernel_size=3,
-        device="cpu"
+        output_dim=1,
+        num_stores=10,
+        num_items=10,
+        store_emb_dim=16,
+        item_emb_dim=16,
     ):
         super().__init__()
-        self.device = device
-        self.FEATURE_LAG = FEATURE_LAG
         self.embed_size = embed_size
         self.input_dim_seq = input_dim_seq
         self.input_dim_static = input_dim_static
-        self.conv1d_emb = conv1d_emb
-        self.conv1d_kernel_size = conv1d_kernel_size
+        self.output_dim = output_dim
 
-        # Embedding Layer (Conv1D or Linear)
-        if conv1d_emb:
-            if conv1d_kernel_size % 2 == 0:
-                raise ValueError("conv1d_kernel_size must be odd to preserve dimensions.")
-            padding = conv1d_kernel_size // 2
-            self.input_embedding = nn.Conv1d(
-                in_channels=input_dim_seq,
-                out_channels=embed_size,
-                kernel_size=conv1d_kernel_size,
-                padding=padding
-            )
-        else:
-            self.input_embedding = nn.Linear(input_dim_seq, embed_size)
+        # Project sequence features to embedding
+        self.input_projection = nn.Linear(input_dim_seq, embed_size)
 
         # Positional Encoding
-        self.position_encoder = PositionalEncoding(d_model=embed_size, dropout=dropout, max_len=FEATURE_LAG)
+        self.pos_encoder = PositionalEncoding(embed_size, dropout)
 
-        # Transformer Encoder Layers
-        encoder_layer = TransformerEncoderLayer(
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_size,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            batch_first=True
+            batch_first=True,
         )
-        self.transformer_encoder = TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Regression Head
-        input_for_regression = FEATURE_LAG * embed_size + input_dim_static
-        hidden_sizes = [input_for_regression, dim_feedforward, dim_feedforward // 2, output_dim]
-        self.regression_layers = nn.ModuleList([
-            nn.Linear(hidden_sizes[i], hidden_sizes[i + 1])
-            for i in range(len(hidden_sizes) - 1)
-        ])
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
+        # Embeddings for static categorical features
+        self.store_emb = nn.Embedding(num_stores, store_emb_dim)
+        self.item_emb = nn.Embedding(num_items, item_emb_dim)
 
-    def forward(self, x_seq: Tensor, x_static: Tensor, src_key_padding_mask=None) -> Tensor:
-        """
-        Forward pass for Transformer model.
+        # Regression head with mean pooling
+        mlp_input = embed_size + store_emb_dim + item_emb_dim
+        self.regressor = nn.Sequential(
+            nn.Linear(mlp_input, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, output_dim),
+        )
 
-        Args:
-            x_seq: [batch, seq_len, input_dim_seq] - (sales, sell_price)
-            x_static: [batch, input_dim_static] - (store_id_encoded, item_id_encoded)
-            src_key_padding_mask: optional mask for padded sequences
+    def forward(self, x_seq, store_idx, item_idx):
+        # Sequence encoding
+        x = self.input_projection(x_seq)
+        x = self.pos_encoder(x)
+        x = self.transformer(x)
 
-        Returns:
-            Tensor: Predicted sales [batch, output_dim]
-        """
-        batch_size = x_seq.size(0)
+        # Mean pooling
+        x_pooled = x.mean(dim=1)
 
-        # Embedding
-        if self.conv1d_emb:
-            x = self.input_embedding(x_seq.transpose(1, 2)).transpose(1, 2)
-        else:
-            x = self.input_embedding(x_seq)
+        # Static embeddings
+        s = self.store_emb(store_idx)
+        i = self.item_emb(item_idx)
 
-        # Add positional encoding
-        x = self.position_encoder(x.transpose(0, 1)).transpose(0, 1)
-
-        # Transformer encoder
-        x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
-
-        # Flatten and concatenate static features
-        x = x.reshape(batch_size, -1)
-        x = torch.cat((x, x_static), dim=1)
-
-        # Regression head
-        for layer in self.regression_layers[:-1]:
-            x = self.dropout(self.relu(layer(x)))
-        out = self.regression_layers[-1](x)
-
+        x_cat = torch.cat((x_pooled, s, i), dim=1)
+        out = self.regressor(x_cat)
         return out

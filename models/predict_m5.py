@@ -1,92 +1,110 @@
-# predict_m5.py
-import os, yaml, pickle, argparse
+# ---------------------------------------------------------
+# predict_m5_fixed.py (Updated with normalization inverse + evaluation + user input)
+# ---------------------------------------------------------
+
+import os
+import yaml
+import torch
 import numpy as np
 import pandas as pd
-import torch
 import matplotlib.pyplot as plt
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from models.transformer_baseline_m5 import ForecastingModel
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from transformer_baseline_m5_fixed import ForecastingModel
 
-def denorm(x, mean, std):
-    return x * std + mean
 
-def prepare_data(sales, price, store, item, FEATURE_LAG, forecast_steps):
-    sales, price, store, item = map(np.asarray, (sales, price, store, item))
-    num_samples = len(sales) - FEATURE_LAG - forecast_steps + 1
-    X_seq, X_static, Y = [], [], []
-    for i in range(num_samples):
-        seq = np.stack([sales[i:i+FEATURE_LAG], price[i:i+FEATURE_LAG]], axis=1)
-        X_seq.append(seq)
-        X_static.append([store[i], item[i]])
-        Y.append(sales[i+FEATURE_LAG:i+FEATURE_LAG+forecast_steps])
-    return np.array(X_seq), np.array(X_static), np.array(Y)
+@torch.no_grad()
+def predict_and_evaluate(config_dataset, config_model, store_id, item_id, forecast_steps):
+    # Load dataset and normalization stats
+    df = pd.read_csv(config_dataset["dataset"]["raw_data_path"], parse_dates=["week_num_global"])
+    stats_path = os.path.join(config_model["CHECKPOINT_PATH"].rsplit("/", 1)[0], "m5_series_stats.csv")
+    stats_df = pd.read_csv(stats_path)
 
-def main(config_path, csv_path):
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    with open(config["METADATA_PATH"], "rb") as f:
-        meta = pickle.load(f)
+    seq_len = config_model["FEATURE_LAG"]
+    cont_features = ["sales", "sell_price"]
 
-    # --- Safe device loading ---
-    device = torch.device("cpu")
-    model = ForecastingModel(**meta["model_params"])
-    model.load_state_dict(torch.load(meta["checkpoint_path"], map_location=device))
-    model.to(device)
-    model.eval()
-
-    # --- Load and normalize data ---
-    df = pd.read_csv(csv_path)
-    print(f"[INFO] Loaded {len(df):,} rows")
-
-    sales, price, store, item = df["sales"], df["sell_price"], df["store_id_encoded"], df["item_id_encoded"]
-
-    sales_norm = (sales - meta["normalization"]["sales_mean"]) / meta["normalization"]["sales_std"]
-    price_norm = (price - meta["normalization"]["price_mean"]) / meta["normalization"]["price_std"]
-    store_norm = (store - meta["normalization"]["store_mean"]) / meta["normalization"]["store_std"]
-    item_norm = (item - meta["normalization"]["item_mean"]) / meta["normalization"]["item_std"]
-
-    X_seq, X_static, Y = prepare_data(
-        sales_norm, price_norm, store_norm, item_norm,
-        config["FEATURE_LAG"], config["FORECAST_STEPS"]
+    # Model setup
+    num_stores = df["store_id_encoded"].nunique()
+    num_items = df["item_id_encoded"].nunique()
+    model = ForecastingModel(
+        input_dim_seq=len(cont_features),
+        input_dim_static=2,
+        embed_size=config_model["MODEL_PARAMS"]["embed_size"],
+        nhead=config_model["MODEL_PARAMS"]["nhead"],
+        num_layers=2,
+        dim_feedforward=256,
+        output_dim=forecast_steps,
+        num_stores=num_stores,
+        num_items=num_items,
     )
 
-    print(f"[INFO] Prepared {len(X_seq):,} sequences for prediction")
+    model.load_state_dict(torch.load(config_model["CHECKPOINT_PATH"], map_location="cpu"))
+    model.eval()
 
-    # --- Memory-safe batched inference ---
-    preds = []
-    batch_size = 128  # adjust based on your system
-    with torch.no_grad():
-        for i in range(0, len(X_seq), batch_size):
-            X_seq_batch = torch.tensor(X_seq[i:i+batch_size], dtype=torch.float32).to(device)
-            X_static_batch = torch.tensor(X_static[i:i+batch_size], dtype=torch.float32).to(device)
-            batch_preds = model(X_seq_batch, X_static_batch).detach().cpu().numpy()
-            preds.append(batch_preds)
-            if i % (batch_size * 100) == 0:
-                print(f"[INFO] Processed {i:,}/{len(X_seq):,} samples")
+    # Select series
+    g = df[(df["store_id_encoded"] == store_id) & (df["item_id_encoded"] == item_id)].sort_values("week_num_global")
+    if len(g) < seq_len + forecast_steps:
+        print("Not enough data for this series.")
+        return
 
-    preds = np.concatenate(preds, axis=0)
+    seq = g[cont_features].values[-(seq_len + forecast_steps) : -forecast_steps]
+    seq[:, 0] = np.log1p(seq[:, 0])
+    x_seq = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
+    store_idx = torch.tensor([store_id], dtype=torch.long)
+    item_idx = torch.tensor([item_id], dtype=torch.long)
 
-    # --- Denormalize and evaluate ---
-    preds = denorm(preds, meta["normalization"]["sales_mean"], meta["normalization"]["sales_std"])
-    Y = denorm(Y, meta["normalization"]["sales_mean"], meta["normalization"]["sales_std"])
+    pred_norm = model(x_seq, store_idx, item_idx).squeeze(0).numpy()
 
-    print("\n[INFO] Evaluation metrics:")
-    print("MAE:", mean_absolute_error(Y.flatten(), preds.flatten()))
-    print("RMSE:", np.sqrt(mean_squared_error(Y.flatten(), preds.flatten())))
-    print("R²:", r2_score(Y.flatten(), preds.flatten()))
+    # Inverse normalization
+    row = stats_df[(stats_df["store_id"] == store_id) & (stats_df["item_id"] == item_id)].iloc[0]
+    mean, std = row["mean"], row["std"]
+    pred_sales = np.expm1(pred_norm * std + mean)
+    
 
-    # --- Plot a small sample ---
+    # Actual future values
+    actual_future = g["sales"].values[-forecast_steps:]
+
+    sales_log = np.log1p(actual_future)
+    actual_norm = (sales_log - mean) / std
+
+    rmse_norm = mean_squared_error(actual_norm, pred_norm)
+    mae_norm = mean_absolute_error(actual_norm, pred_norm)
+    rmse_log = mean_squared_error(sales_log, np.log1p(pred_sales))
+    mae_log = mean_absolute_error(sales_log, np.log1p(pred_sales))
+
+    print(f"Normalized-space RMSE: {rmse_norm:.4f}, MAE: {mae_norm:.4f}")
+    print(f"Log-space RMSE: {rmse_log:.4f}, MAE: {mae_log:.4f}")
+
+    print(f'actual_future_value: {actual_future}, pred_sales: {pred_sales}')
+    print(f'actual_norm_value: {actual_norm}, pred_norm: {pred_norm}')
+
+    # # Evaluate metrics
+    # rmse = mean_squared_error(actual_future, pred_sales)
+    # mae = mean_absolute_error(actual_future, pred_sales)
+    # print(f"RMSE: {rmse:.2f}, MAE: {mae:.2f}")
+
+    # Plot
     plt.figure(figsize=(10, 4))
-    plt.plot(Y.flatten()[:200], label="Actual")
-    plt.plot(preds.flatten()[:200], label="Predicted")
+    plt.plot(g["week_num_global"].values[-(seq_len + forecast_steps) : -forecast_steps], np.expm1(seq[:, 0]), label="Past Sales", color="blue")
+    plt.plot(g["week_num_global"].values[-forecast_steps:], pred_sales, label="Forecast", color="orange", marker="o")
+    plt.plot(g["week_num_global"].values[-forecast_steps:], actual_future, label="Actual", color="green", linestyle="--", marker="x")
+    plt.title(f"Store {store_id}, Item {item_id} — Forecast vs Actual")
+    plt.xlabel("Week Num")
+    plt.ylabel("Sales")
     plt.legend()
-    plt.title("M5 Sales Forecasting (Transformer)")
     plt.tight_layout()
     plt.show()
 
+    return pred_sales, actual_future, rmse, mae
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--csv", required=True)
-    args = parser.parse_args()
-    main(args.config, args.csv)
+    with open("config/config_m5.yaml", "r") as f1, open("config/model_config_m5.yaml", "r") as f2:
+        config_dataset = yaml.safe_load(f1)
+        config_model = yaml.safe_load(f2)
+
+    # Interactive console inputs
+    store_id = int(input("Enter store_id: "))
+    item_id = int(input("Enter item_id: "))
+    forecast_steps = int(input(f"Enter forecast length (default={config_model['FORECAST_STEPS']}): ") or config_model["FORECAST_STEPS"])
+
+    predict_and_evaluate(config_dataset, config_model, store_id, item_id, forecast_steps)
