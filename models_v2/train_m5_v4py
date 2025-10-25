@@ -1,0 +1,340 @@
+# ---------------------------------------------------------
+# train_m5_v3.py (IMPROVED VERSION)
+#
+# KEY IMPROVEMENTS:
+# 1. Proper feature engineering with lags and rolling statistics
+# 2. Feature normalization (StandardScaler per series)
+# 3. NO DATA LEAKAGE - removed sales from input features
+# 4. Train/validation split for monitoring
+# 5. Early stopping to prevent overfitting
+# 6. Learning rate scheduling
+# 7. Better loss function (Huber loss for robustness)
+# ---------------------------------------------------------
+
+import os
+import yaml
+import torch
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import StandardScaler
+from transformer_baseline_m5_v4 import ForecastingModel
+
+
+# ---------------------------------------------------------
+# 1. IMPROVED Preprocessing Function
+# ---------------------------------------------------------
+def preprocess_m5_data(config_dataset):
+    """
+    IMPROVED: Cleans, engineers features, and normalizes data
+    
+    Key improvements:
+    - Lag features (sales history without leakage)
+    - Rolling statistics (trend indicators)
+    - Proper normalization per store-item
+    """
+
+    df = pd.read_csv(config_dataset["dataset"]["raw_data_path"], parse_dates=["date"])
+    print(f"✅ Loaded raw data: {df.shape}")
+
+    # Ensure consistent column naming
+    df.columns = [c.strip() for c in df.columns]
+    
+    required_cols = [
+        "store_id_encoded",
+        "item_id_encoded",
+        "sales",
+        "sell_price",
+        "date",
+        "week_of_year",
+        "month",
+        "snap_CA_encoded",
+        "event_name_1_encoded",
+    ]
+
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in dataset: {missing}")
+
+    # Sort and drop duplicates
+    df = df.sort_values(["store_id_encoded", "item_id_encoded", "date"]).drop_duplicates()
+
+    # Fill NaN values
+    for c in ["sell_price", "event_name_1_encoded", "snap_CA_encoded", "week_of_year", "month"]:
+        df[c] = df[c].fillna(0)
+
+    # Convert encoded IDs to int
+    df["store_id_encoded"] = df["store_id_encoded"].astype(int)
+    df["item_id_encoded"] = df["item_id_encoded"].astype(int)
+
+    # Filter date range (optional)
+    if "dates" in config_dataset and config_dataset["dates"].get("start_date"):
+        start = pd.to_datetime(config_dataset["dates"]["start_date"])
+        end = pd.to_datetime(config_dataset["dates"]["end_date"])
+        df = df[(df["date"] >= start) & (df["date"] <= end)]
+
+    # ==============================================================
+    # CRITICAL IMPROVEMENT: Feature Engineering
+    # ==============================================================
+    print("🔧 Engineering lag features and rolling statistics...")
+    
+    def engineer_features(group):
+        """Create lag and rolling features per store-item"""
+        group = group.sort_values('date').copy()
+        
+        # Lag features (past sales without leakage)
+        for lag in [1, 2, 3, 7, 14, 28]:
+            group[f'sales_lag_{lag}'] = group['sales'].shift(lag)
+        
+        # Rolling statistics (trend indicators)
+        for window in [7, 14, 28]:
+            group[f'sales_rolling_mean_{window}'] = group['sales'].shift(1).rolling(window, min_periods=1).mean()
+            group[f'sales_rolling_std_{window}'] = group['sales'].shift(1).rolling(window, min_periods=1).std()
+        
+        # Price features
+        group['price_lag_1'] = group['sell_price'].shift(1)
+        group['price_change'] = group['sell_price'].pct_change()
+        
+        # Fill NaN from lag operations
+        group = group.fillna(method='bfill').fillna(0)
+        
+        return group
+    
+    df = df.groupby(['store_id_encoded', 'item_id_encoded'], group_keys=False).apply(engineer_features)
+    
+    # Add day of week (important for retail)
+    df['day_of_week'] = pd.to_datetime(df['date']).dt.dayofweek
+    
+    # Cyclical encoding for temporal features
+    df['week_sin'] = np.sin(2 * np.pi * df['week_of_year'] / 52)
+    df['week_cos'] = np.cos(2 * np.pi * df['week_of_year'] / 52)
+    df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+    df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+    df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+
+    print(f"✅ Processed data with features: {df.shape}")
+    return df
+
+
+# ---------------------------------------------------------
+# 2. IMPROVED Dataset Class
+# ---------------------------------------------------------
+class M5Dataset(Dataset):
+    """
+    IMPROVED Dataset with:
+    - NO DATA LEAKAGE (sales removed from input)
+    - Proper normalization per series
+    - Train/validation split awareness
+    """
+    
+    def __init__(self, df, seq_len, horizon, cont_features, is_train=True, train_ratio=0.8):
+        self.seq_len = seq_len
+        self.horizon = horizon
+        self.cont_features = cont_features
+        self.samples = []
+        self.scalers = {}  # Store scalers per series for normalization
+
+        grouped = df.groupby(["store_id_encoded", "item_id_encoded"])
+        
+        for (store, item), g in grouped:
+            g = g.sort_values("date").reset_index(drop=True)
+            
+            if len(g) <= seq_len + horizon:
+                continue
+            
+            # IMPROVEMENT: Train/validation split
+            split_idx = int(len(g) * train_ratio)
+            if is_train:
+                g = g.iloc[:split_idx]
+            else:
+                g = g.iloc[split_idx:]
+            
+            if len(g) <= seq_len + horizon:
+                continue
+            
+            # Target: log-transformed sales
+            sales_log = np.log1p(g["sales"].values)
+            
+            # CRITICAL: Input features WITHOUT sales (no leakage!)
+            cont_data = g[self.cont_features].values
+            
+            # IMPROVEMENT: Normalize features per series
+            scaler = StandardScaler()
+            cont_data_norm = scaler.fit_transform(cont_data)
+            self.scalers[(store, item)] = scaler
+            
+            # Create sequences
+            for i in range(len(g) - seq_len - horizon + 1):
+                seq = cont_data_norm[i : i + seq_len]
+                y = sales_log[i + seq_len : i + seq_len + horizon]
+                
+                self.samples.append({
+                    "x_seq": torch.tensor(seq, dtype=torch.float32),
+                    "store": torch.tensor(int(store), dtype=torch.long),
+                    "item": torch.tensor(int(item), dtype=torch.long),
+                    "y": torch.tensor(y, dtype=torch.float32),
+                })
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        return s["x_seq"], s["store"], s["item"], s["y"]
+
+
+# ---------------------------------------------------------
+# 3. IMPROVED Training Function
+# ---------------------------------------------------------
+def train_m5(config_dataset, config_model):
+    """
+    IMPROVED training with:
+    - Validation monitoring
+    - Early stopping
+    - Learning rate scheduling
+    - Better loss function
+    """
+    
+    torch.manual_seed(config_model["SEED"])
+    np.random.seed(config_model["SEED"])
+
+    # Load and preprocess data
+    df = preprocess_m5_data(config_dataset)
+
+    seq_len = config_model["FEATURE_LAG"]
+    horizon = config_model["FORECAST_STEPS"]
+
+    # CRITICAL: Input features WITHOUT sales (no data leakage!)
+    cont_features = [
+        # Lag features (historical sales without leakage)
+        "sales_lag_1", "sales_lag_2", "sales_lag_3", "sales_lag_7", "sales_lag_14", "sales_lag_28",
+        # Rolling statistics
+        "sales_rolling_mean_7", "sales_rolling_std_7",
+        "sales_rolling_mean_14", "sales_rolling_std_14",
+        "sales_rolling_mean_28", "sales_rolling_std_28",
+        # Price features
+        "sell_price", "price_lag_1", "price_change",
+        # Temporal features (cyclical encoding)
+        "week_sin", "week_cos", "month_sin", "month_cos", "dow_sin", "dow_cos",
+        # Events
+        "snap_CA_encoded", "event_name_1_encoded",
+    ]
+
+    # IMPROVEMENT: Train/validation split
+    train_dataset = M5Dataset(df, seq_len, horizon, cont_features, is_train=True, train_ratio=0.8)
+    val_dataset = M5Dataset(df, seq_len, horizon, cont_features, is_train=False, train_ratio=0.8)
+    
+    train_loader = DataLoader(train_dataset, batch_size=config_model["BATCH_SIZE"], shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=config_model["BATCH_SIZE"], shuffle=False)
+    
+    print(f"✅ Training samples: {len(train_dataset)}")
+    print(f"✅ Validation samples: {len(val_dataset)}")
+
+    num_stores = df["store_id_encoded"].nunique()
+    num_items = df["item_id_encoded"].nunique()
+
+    model = ForecastingModel(
+        input_dim_seq=len(cont_features),
+        input_dim_static=2,
+        embed_size=64,  # Increased for better capacity
+        nhead=8,
+        num_layers=3,  # Added layer for more complexity
+        dim_feedforward=256,
+        dropout=0.2,  # Added dropout for regularization
+        output_dim=horizon,
+        num_stores=num_stores,
+        num_items=num_items,
+        store_emb_dim=16,
+        item_emb_dim=16,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    print(f"🖥️  Using device: {device}")
+
+    optimizer = optim.AdamW(model.parameters(), lr=config_model["LEARNING_RATE"], weight_decay=1e-5)
+    
+    # IMPROVEMENT: Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    
+    # IMPROVEMENT: Huber loss (more robust to outliers than MSE)
+    criterion = nn.HuberLoss(delta=1.0)
+
+    # Early stopping
+    best_val_loss = float('inf')
+    patience = 10
+    patience_counter = 0
+
+    print("🚀 Starting training...")
+    for epoch in range(config_model["EPOCHS"]):
+        # Training
+        model.train()
+        total_train_loss = 0
+        for x_seq, store, item, y in train_loader:
+            x_seq, store, item, y = x_seq.to(device), store.to(device), item.to(device), y.to(device)
+            optimizer.zero_grad()
+            pred = model(x_seq, store, item)
+            loss = criterion(pred, y)
+            loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            total_train_loss += loss.item()
+
+        avg_train_loss = total_train_loss / len(train_loader)
+
+        # Validation
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for x_seq, store, item, y in val_loader:
+                x_seq, store, item, y = x_seq.to(device), store.to(device), item.to(device), y.to(device)
+                pred = model(x_seq, store, item)
+                loss = criterion(pred, y)
+                total_val_loss += loss.item()
+
+        avg_val_loss = total_val_loss / len(val_loader)
+        
+        print(f"Epoch [{epoch+1}/{config_model['EPOCHS']}] | "
+              f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+
+        # Learning rate scheduling
+        scheduler.step(avg_val_loss)
+
+        # Early stopping
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            # Save best model
+            os.makedirs(os.path.dirname(config_model["CHECKPOINT_PATH"]), exist_ok=True)
+            torch.save(model.state_dict(), config_model["CHECKPOINT_PATH"])
+            print(f"💾 Saved best model (val_loss: {best_val_loss:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"⚠️ Early stopping triggered after {epoch+1} epochs")
+                break
+
+    print(f"\n✅ Training complete! Best validation loss: {best_val_loss:.4f}")
+    print(f"📁 Model saved to: {config_model['CHECKPOINT_PATH']}")
+
+
+if __name__ == "__main__":
+    with open("config/config_m5.yaml", "r") as f1, open("config/model_config_m5.yaml", "r") as f2:
+        config_dataset = yaml.safe_load(f1)
+        config_model = yaml.safe_load(f2)
+
+    # Improved hyperparameters
+    config_model["FEATURE_LAG"] = 28  # Longer context (4 weeks)
+    config_model["FORECAST_STEPS"] = 4
+    config_model["BATCH_SIZE"] = 64
+    config_model["LEARNING_RATE"] = 0.0005  # Lower learning rate
+    config_model["EPOCHS"] = 100  # More epochs with early stopping
+    config_model["SEED"] = 42
+
+    train_m5(config_dataset, config_model)
