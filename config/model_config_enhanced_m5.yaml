@@ -1,0 +1,81 @@
+# model_config_enhanced_m5.yaml
+# =========================================================
+# Enhanced Configuration for M5 Transformer Forecasting
+# =========================================================
+
+SEED: 42
+
+# --- Feature Definitions ---
+TARGET_FEATURE_COLUMN: sales
+
+STATIC_FEATURES:
+  - item_id_encoded
+  - dept_id_encoded
+  - cat_id_encoded
+  - store_id_encoded
+  - state_id_encoded
+
+SEQUENTIAL_FEATURES:
+  - sales
+  - sell_price
+  - event_name_1_encoded
+  - event_type_1_encoded
+  - event_name_2_encoded
+  - event_type_2_encoded
+  - day_of_week
+  - month
+  - year
+  - snap
+  - lag_1
+  - lag_2
+  - lag_3
+  - lag_7
+  - lag_28
+  - rolling_7
+  - rolling_28
+
+# --- Forecasting Horizon ---
+FORECAST_STEPS: 30  # Predict 30 days ahead
+FEATURE_LAG: 28     # Use 28 days of history
+
+# --- Training Parameters ---
+EPOCHS: 300  # Increased for better convergence
+BATCH_SIZE: 128  # Larger batch for stability
+LEARNING_RATE: 0.0005  # Lower LR with OneCycleLR
+
+# --- Loss Configuration ---
+USE_QUANTILE_LOSS: true  # Enable quantile regression
+# If true, model predicts 3 quantiles (0.1, 0.5, 0.9)
+
+# --- Regularization & Early Stopping ---
+EARLY_STOPPING_PATIENCE: 300
+VAL_DAYS: 180  # Use 6 months for validation
+
+# --- File Paths ---
+CHECKPOINT_PATH: model_paths/m5_enhanced_model.pth
+METADATA_PATH: model_paths/m5_enhanced_metadata.pkl
+PREDICT_OUTPUT_DIR: predictions_m5_enhanced
+
+# --- Model Architecture ---
+MODEL_PARAMS:
+  FEATURE_LAG: 28
+  output_dim: 30
+  
+  # Feature dimensions
+  input_dim_seq: 17   # Count of SEQUENTIAL_FEATURES
+  input_dim_static: 5  # Count of STATIC_FEATURES
+  
+  # Transformer parameters
+  embed_size: 128     # Increased from 128
+  nhead: 8
+  num_layers: 10        # Increased from 6
+  dim_feedforward: 1024 # Increased from 512
+  dropout: 0.1        # Slightly increased dropout ---> 0.15
+  
+  # These will be set automatically by training script:
+  num_items: null
+  num_stores: null
+  num_depts: null
+  num_cats: null
+  use_quantile: true
+  device: "mps"

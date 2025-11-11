@@ -1,0 +1,76 @@
+# model_config_m5.yaml
+# ---------------------------------------------------------
+# Configuration for DAILY Transformer-based M5 Forecasting
+# ---------------------------------------------------------
+
+SEED: 42
+
+# --- Feature Definitions ---
+# These MUST match the columns from preprocessor.py
+# 'sales' is our target
+TARGET_FEATURE_COLUMN: sales
+
+# Static features (don't change over time)
+STATIC_FEATURES:
+  - item_id_encoded
+  - dept_id_encoded
+  - cat_id_encoded
+  - store_id_encoded
+  - state_id_encoded
+
+# Sequential features (change daily)
+SEQUENTIAL_FEATURES:
+  - sales # We use sales as an input (as a lag)
+  - sell_price
+  - event_name_1_encoded
+  - event_type_1_encoded
+  - event_name_2_encoded
+  - event_type_2_encoded
+  - day_of_week
+  - month
+  - year
+  - snap
+  - lag_1   # <-- ADD
+  - lag_2   # <-- ADD
+  - lag_3   # <-- ADD
+  - lag_7
+  - lag_28
+  - rolling_7
+  - rolling_28
+
+# --- Sequence & Horizon ---
+# Predict next 7 days
+FORECAST_STEPS: 30
+# Use last 28 days of history
+FEATURE_LAG: 28
+
+# --- Training parameters ---
+# Reduced epochs for daily data (which is much larger)
+EPOCHS: 300
+BATCH_SIZE: 64
+LEARNING_RATE: 0.001
+
+# --- File paths ---
+CHECKPOINT_PATH: model_paths/m5_daily_model.pth
+METADATA_PATH: model_paths/m5_daily_metadata.pkl
+PREDICT_OUTPUT_DIR: predictions_m5
+
+# --- Model architecture parameters ---
+MODEL_PARAMS:
+  FEATURE_LAG: 28     # Must match FEATURE_LAG
+  output_dim: 30       # Must match FORECAST_STEPS
+  
+  # --- CRITICAL: Updated dimensions ---
+  # Count of features in SEQUENTIAL_FEATURES
+  input_dim_seq: 17 # <-- UPDATE (was 14, now 14 + 3 = 17)  
+  # Count of features in STATIC_FEATURES
+  input_dim_static: 5 
+  
+  embed_size: 64
+  nhead: 8
+  num_layers: 4 # Reduced layers for faster training ---> 4
+  dim_feedforward: 256
+  dropout: 0.1
+  conv1d_emb: true
+  conv1d_kernel_size: 3
+  device: "mps" # Set automatically by train_m5.py

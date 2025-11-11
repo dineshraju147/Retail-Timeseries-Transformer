@@ -1,0 +1,36 @@
+# config_m5.yaml
+# ---------------------------------------------------------
+# Configuration for M5 Daily Forecasting Pipeline
+# ---------------------------------------------------------
+# This config points to the *raw* M5 files and controls
+# feature engineering and sampling.
+
+dataset:
+  # --- Paths to RAW M5 files ---
+  # Assumes files are in a 'data/' directory
+  sales_path: 'data/sales_train_validation.csv'
+  prices_path: 'data/sell_prices.csv'
+  calendar_path: 'data/calendar.csv'
+
+  # --- Aggregation Config (MUST BE 1) ---
+  # 1 = daily data
+  aggregation_days: 1
+  validate_quality: True
+  
+  # --- Validation Split ---
+  # This will be handled by the training script
+  val_split_pct: 0.2
+
+  # --- Sampling Config ---
+  # Set to a number (e.g., 100) for fast testing
+  # Set to 'null' (without quotes) to load all 30,000+ items.
+  sample_items: 100
+
+training:
+  seed: 42
+
+output:
+  model_output_dir: model_paths/
+  predictions_dir: predictions_m5/
+  # Path to save the processed data
+  processed_data_path: data/m5_daily_processed.pkl
